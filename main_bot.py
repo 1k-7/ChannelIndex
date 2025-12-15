@@ -3,11 +3,12 @@ import json
 import asyncio
 import logging
 import time
-from aiohttp import web, ClientSession # For Render Port Binding & Self-Ping
-from pyrogram import Client, filters, enums, idle
+from typing import Union, Optional, AsyncGenerator
+from aiohttp import web, ClientSession 
+from pyrogram import Client, filters, enums, idle, types
 from pyrogram.errors import FloodWait
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-import pyromod  # <--- CRITICAL: Fixes 'Client object has no attribute listen'
+import pyromod  # Fixes 'listen' attribute error
 
 from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID, INDEX_EXTENSIONS
 from db_utils import db
@@ -18,6 +19,52 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# --- CUSTOM ITER_MESSAGES (Fixed 'iter_messages' error) ---
+async def iter_messages(
+    self: Client, 
+    chat_id: Union[int, str], 
+    limit: int, 
+    offset: int = 0
+) -> Optional[AsyncGenerator["types.Message", None]]:
+    """
+    Custom method to iterate messages sequentially using get_messages with ID lists.
+    Iterates from 'offset' (oldest) to 'limit' (newest).
+    """
+    current = offset
+    while True:
+        new_diff = min(200, limit - current)
+        if new_diff <= 0:
+            return
+        
+        # Create a list of message IDs to fetch in a batch
+        # range is exclusive at the end, so we add +1
+        ids_to_fetch = list(range(current, current + new_diff + 1))
+        
+        try:
+            messages = await self.get_messages(chat_id, ids_to_fetch)
+        except Exception as e:
+            logger.error(f"Error fetching messages {ids_to_fetch[0]}-{ids_to_fetch[-1]}: {e}")
+            # If we fail to get a batch, we increment current to avoid infinite loops, 
+            # effectively skipping this batch.
+            current += new_diff
+            continue
+
+        # Check if messages is None or empty (can happen if IDs don't exist)
+        if not messages:
+            current += new_diff
+            continue
+
+        for message in messages:
+            # get_messages might return None for deleted/non-existent IDs in the list
+            if message:
+                yield message
+        
+        current += new_diff + 1
+
+# Monkey Patch: Add this method to the Pyrogram Client
+Client.iter_messages = iter_messages
+
 
 # --- WEB SERVER & SELF-PING ---
 routes = web.RouteTableDef()
@@ -32,15 +79,13 @@ async def web_server():
     return web_app
 
 async def auto_ping():
-    """Pings the bot's own Render URL every 10 minutes to stay awake."""
-    # Render automatically sets this variable
+    """Pings the bot's own Render URL every 10 minutes."""
     url = os.environ.get("RENDER_EXTERNAL_URL") 
     
     if not url:
         logger.warning("No RENDER_EXTERNAL_URL found. Self-ping disabled.")
         return
 
-    # Ensure URL starts with http/https
     if not url.startswith("http"):
         url = f"http://{url}"
         
@@ -54,21 +99,17 @@ async def auto_ping():
         except Exception as e:
             logger.error(f"Auto-ping failed: {e}")
         
-        # Wait 10 minutes (600 seconds)
         await asyncio.sleep(600)
 
 # --- UTILS ---
 def get_readable_time(seconds: int) -> str:
-    count = 0
-    up_time = ""
     time_list = []
-    time_list.extend([int(seconds / 60 / 60 / 24), int(seconds / 60 / 60) % 24, int(seconds / 60) % 60, int(seconds) % 60])
+    time_list.extend([int(seconds / 86400), int(seconds / 3600) % 24, int(seconds / 60) % 60, int(seconds) % 60])
+    up_time = ""
     for i, j in enumerate(time_list):
         if j != 0:
             up_time += f"{j}{'d' if i==0 else 'h' if i==1 else 'm' if i==2 else 's'} "
-    if not up_time:
-        return '1s'
-    return up_time.strip()
+    return up_time.strip() if up_time else '1s'
 
 # --- GLOBALS ---
 lock = asyncio.Lock()
@@ -96,21 +137,26 @@ async def index_files_to_db(lst_msg_id: int, chat, msg: Message, bot: Client, sk
     
     async with lock:
         try:
-            async for message in bot.iter_messages(chat, lst_msg_id, skip):
-                time_taken = get_readable_time(time.time() - start_time)
+            # Using the monkey-patched iter_messages
+            async for message in bot.iter_messages(chat.id, lst_msg_id, skip):
                 
                 if CANCEL:
                     CANCEL = False
-                    await msg.edit(f"Successfully Cancelled!\nCompleted in {time_taken}\n\nSaved {total_files} files!")
+                    time_taken = get_readable_time(time.time() - start_time)
+                    await msg.edit(f"🛑 **Cancelled!**\nSaved: {total_files}\nTime: {time_taken}")
                     return
 
-                current += 1
+                current = message.id # Sync current with actual message ID
                 
-                if current % 30 == 0:
-                    btn = [[InlineKeyboardButton('CANCEL', callback_data=f'index#cancel')]]
+                # Update status every 50 messages (reduced frequency to avoid floodwait)
+                if total_files % 50 == 0:
                     try:
+                        btn = [[InlineKeyboardButton('CANCEL', callback_data=f'index#cancel')]]
                         await msg.edit_text(
-                            text=f"Total messages received: <code>{current}</code>\nTotal files saved: <code>{total_files}</code>\nDuplicate: {duplicate} | Errors: {errors}", 
+                            text=f"**Indexing...**\n"
+                                 f"Msg ID: `{current}` / `{lst_msg_id}`\n"
+                                 f"Saved: `{total_files}`\n"
+                                 f"Errors: `{errors}`", 
                             reply_markup=InlineKeyboardMarkup(btn)
                         )
                     except FloodWait as e:
@@ -126,7 +172,7 @@ async def index_files_to_db(lst_msg_id: int, chat, msg: Message, bot: Client, sk
                     continue
                 
                 media_type = message.media.value
-                if media_type not in [enums.MessageMediaType.VIDEO, enums.MessageMediaType.DOCUMENT]:
+                if media_type not in [enums.MessageMediaType.VIDEO, enums.MessageMediaType.DOCUMENT, enums.MessageMediaType.AUDIO]:
                     unsupported += 1
                     continue
                 
@@ -135,10 +181,15 @@ async def index_files_to_db(lst_msg_id: int, chat, msg: Message, bot: Client, sk
                     unsupported += 1
                     continue
                 
-                file_name = str(media.file_name).lower() if media.file_name else ""
+                # Extension Check
+                file_name = str(getattr(media, "file_name", "")).lower()
                 if not file_name.endswith(INDEX_EXTENSIONS):
-                    unsupported += 1
-                    continue
+                    # Check if it's a video/audio without filename that we still want
+                    if media_type == enums.MessageMediaType.VIDEO and not file_name:
+                         pass # Allow unnamed videos
+                    else:
+                        unsupported += 1
+                        continue
                 
                 sts = await db.save_file(message, media)
                 if sts == 'suc':
@@ -150,11 +201,17 @@ async def index_files_to_db(lst_msg_id: int, chat, msg: Message, bot: Client, sk
 
         except Exception as e:
             logger.exception("Indexing loop error")
-            await msg.reply(f'Index canceled due to Error - {e}')
+            await msg.reply(f'❌ Index canceled due to Error: `{e}`')
         
         # Final Completion
         time_taken = get_readable_time(time.time() - start_time)
-        await msg.edit(f'✅ **Indexing Complete!**\nSaved <code>{total_files}</code> files.\nTime: {time_taken}\n\n**Preparing JSON backup...**')
+        await msg.edit(
+            f'✅ **Indexing Complete!**\n'
+            f'Saved: `{total_files}`\n'
+            f'Duplicates: `{duplicate}`\n'
+            f'Time: `{time_taken}`\n\n'
+            f'**Sending JSON backup...**'
+        )
         await send_backup(bot, msg.chat.id)
         
 async def send_backup(client, target_chat_id):
@@ -167,10 +224,14 @@ async def send_backup(client, target_chat_id):
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
 
-        await client.send_document(chat_id=target_chat_id, document=file_path, caption=f"📦 **Backup**\nRecords: `{len(data)}`")
+        await client.send_document(
+            chat_id=target_chat_id, 
+            document=file_path, 
+            caption=f"📦 **Backup File**\nTotal Records: `{len(data)}`"
+        )
     except Exception as e:
         logger.error(f"Error during backup: {e}")
-        await client.send_message(target_chat_id, f"❌ Error: `{str(e)}`")
+        await client.send_message(target_chat_id, f"❌ Error sending backup: `{str(e)}`")
     finally:
         if os.path.exists(file_path):
             os.remove(file_path)
@@ -184,11 +245,10 @@ async def start_command(client, message):
 @app.on_message(filters.command('index') & filters.private & filters.user(OWNER_ID))
 async def send_for_index(bot: Client, message: Message):
     if lock.locked():
-        return await message.reply('Wait until previous process complete.')
+        return await message.reply('⚠️ A process is already running. Wait until it completes.')
     
     i = await message.reply("Forward the **last message** of the channel or send its link.")
     
-    # This .listen() call works because pyromod is imported
     try:
         msg_input = await bot.listen(chat_id=message.chat.id, user_id=message.from_user.id)
     except Exception as e:
@@ -206,6 +266,9 @@ async def send_for_index(bot: Client, message: Message):
             chat_id = msg_link[-2]
             if chat_id.isnumeric():
                 chat_id = int(f"-100{chat_id}")
+            else:
+                 # Handle username case (e.g., t.me/channelname/123)
+                 chat_id = chat_id 
         except:
             return await message.reply('❌ Invalid link!')
     elif msg_input.forward_from_chat and msg_input.forward_from_chat.type == enums.ChatType.CHANNEL:
@@ -217,9 +280,9 @@ async def send_for_index(bot: Client, message: Message):
     try:
         chat = await bot.get_chat(chat_id)
     except:
-        return await message.reply(f'❌ Error: Cannot access chat. Make sure I am Admin there.')
+        return await message.reply(f'❌ Error: Cannot access chat `{chat_id}`.\nMake sure I am added as an **Admin** there.')
 
-    s = await message.reply("Send skip message number (0 to start from beginning).")
+    s = await message.reply("Send skip message number (Send `0` to start from beginning).")
     msg_skip = await bot.listen(chat_id=message.chat.id, user_id=message.from_user.id)
     await s.delete()
     try:
@@ -227,8 +290,17 @@ async def send_for_index(bot: Client, message: Message):
     except:
         return await message.reply("❌ Invalid number.")
 
-    buttons = [[InlineKeyboardButton('YES', callback_data=f'index#yes#{chat_id}#{last_msg_id}#{skip}'), InlineKeyboardButton('CLOSE', callback_data='close_data')]]
-    await message.reply(f'Index **{chat.title}**?\nTotal Messages: <code>{last_msg_id}</code>', reply_markup=InlineKeyboardMarkup(buttons))
+    buttons = [[
+        InlineKeyboardButton('YES', callback_data=f'index#yes#{chat.id}#{last_msg_id}#{skip}'), 
+        InlineKeyboardButton('CLOSE', callback_data='close_data')
+    ]]
+    await message.reply(
+        f'📝 **Index Request**\n\n'
+        f'**Channel:** {chat.title}\n'
+        f'**Total Messages:** `{last_msg_id}`\n'
+        f'**Start From:** `{skip}`', 
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
 
 @app.on_callback_query(filters.regex(r'^index'))
 async def index_files_callback(bot, query):
@@ -239,10 +311,15 @@ async def index_files_callback(bot, query):
     elif query.data.startswith('index#yes#'):
         try:
             _, _, chat, lst_msg_id, skip = query.data.split("#")
-            chat = int(chat) if chat.lstrip('-').isdigit() else chat
-            await index_files_to_db(int(lst_msg_id), chat, query.message, bot, int(skip))
+            # Ensure chat_id is integer
+            chat_id = int(chat)
+            # Retrieve Chat object for title/etc (optional, but good for context)
+            chat_obj = await bot.get_chat(chat_id)
+            
+            await index_files_to_db(int(lst_msg_id), chat_obj, query.message, bot, int(skip))
         except Exception as e:
-            await query.message.edit(f"Error: {e}")
+            logger.error(f"Callback error: {e}")
+            await query.message.edit(f"❌ Error starting index: `{e}`")
     await query.answer()
 
 @app.on_callback_query(filters.regex(r'^close_data'))
@@ -251,10 +328,8 @@ async def close_callback(bot, query):
 
 # --- MAIN EXECUTION ---
 if __name__ == "__main__":
-    # Get PORT from Render environment, default to 8080
     PORT = int(os.environ.get("PORT", 8080))
     
-    # Initialize the Web App
     app_web = web.Application(client_max_size=30000000)
     app_web.add_routes(routes)
 
@@ -276,6 +351,5 @@ if __name__ == "__main__":
         await idle()
         await app.stop()
 
-    # Run everything
     loop = asyncio.get_event_loop()
     loop.run_until_complete(start_services())
