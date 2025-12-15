@@ -3,7 +3,7 @@ import json
 import asyncio
 import logging
 import time
-from aiohttp import web  # For Render Port Binding
+from aiohttp import web, ClientSession # For Render Port Binding & Self-Ping
 from pyrogram import Client, filters, enums, idle
 from pyrogram.errors import FloodWait
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
@@ -19,7 +19,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- WEB SERVER FOR RENDER (AUTO PING) ---
+# --- WEB SERVER & SELF-PING ---
 routes = web.RouteTableDef()
 
 @routes.get("/", allow_head=True)
@@ -30,6 +30,32 @@ async def web_server():
     web_app = web.Application(client_max_size=30000000)
     web_app.add_routes(routes)
     return web_app
+
+async def auto_ping():
+    """Pings the bot's own Render URL every 10 minutes to stay awake."""
+    # Render automatically sets this variable
+    url = os.environ.get("RENDER_EXTERNAL_URL") 
+    
+    if not url:
+        logger.warning("No RENDER_EXTERNAL_URL found. Self-ping disabled.")
+        return
+
+    # Ensure URL starts with http/https
+    if not url.startswith("http"):
+        url = f"http://{url}"
+        
+    logger.info(f"Auto-ping started for URL: {url}")
+    
+    while True:
+        try:
+            async with ClientSession() as session:
+                async with session.get(url) as resp:
+                    logger.info(f"Pinged {url} - Status: {resp.status}")
+        except Exception as e:
+            logger.error(f"Auto-ping failed: {e}")
+        
+        # Wait 10 minutes (600 seconds)
+        await asyncio.sleep(600)
 
 # --- UTILS ---
 def get_readable_time(seconds: int) -> str:
@@ -162,8 +188,12 @@ async def send_for_index(bot: Client, message: Message):
     
     i = await message.reply("Forward the **last message** of the channel or send its link.")
     
-    # This .listen() call will now work because pyromod is imported
-    msg_input = await bot.listen(chat_id=message.chat.id, user_id=message.from_user.id)
+    # This .listen() call works because pyromod is imported
+    try:
+        msg_input = await bot.listen(chat_id=message.chat.id, user_id=message.from_user.id)
+    except Exception as e:
+        return await message.reply(f"❌ Listener Error: {e}")
+
     await i.delete()
     
     chat_id = None
@@ -239,6 +269,10 @@ if __name__ == "__main__":
         # Start Bot
         logger.info("Starting Bot...")
         await app.start()
+        
+        # Start Auto Ping Task
+        asyncio.create_task(auto_ping())
+        
         await idle()
         await app.stop()
 
