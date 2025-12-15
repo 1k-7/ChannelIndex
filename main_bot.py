@@ -78,7 +78,7 @@ async def fetch_and_save_batch(bot, chat_id, batch_ids):
     valid_docs = []
     messages = []
     
-    # Retry Loop
+    # Retry Loop for Network/FloodWait
     retries = 0
     max_retries = 10
     
@@ -93,7 +93,7 @@ async def fetch_and_save_batch(bot, chat_id, batch_ids):
             if retries >= max_retries:
                 logger.error(f"Dropped batch {batch_ids[0]}-{batch_ids[-1]}: {e}")
                 return 0, 0 
-            await asyncio.sleep(min(retries, 10))
+            await asyncio.sleep(min(retries, 5))
 
     if not messages:
         return 0, 0
@@ -107,14 +107,17 @@ async def fetch_and_save_batch(bot, chat_id, batch_ids):
         if not message.media:
             continue
             
-        # Get Media Object (Video, Doc, Audio, Photo, Voice, etc.)
+        # Get Media Object (Video, Doc, Audio)
+        # Note: We skip PHOTOS to prevent database spam, but include all files.
+        if message.media not in [enums.MessageMediaType.VIDEO, enums.MessageMediaType.DOCUMENT, enums.MessageMediaType.AUDIO]:
+            continue
+
         media_type_str = message.media.value
         media = getattr(message, media_type_str, None)
         if not media:
             continue
 
-        # --- NO EXTENSION FILTER --- 
-        # We accept EVERYTHING.
+        # --- NO EXTENSION FILTER APPLIED --- 
         
         try:
             # Try to unpack file_id. If fails, skip.
@@ -123,7 +126,7 @@ async def fetch_and_save_batch(bot, chat_id, batch_ids):
             # Determine filename
             filename = getattr(media, "file_name", None)
             if not filename:
-                # Fallback for unnamed media
+                # Fallback for unnamed media (e.g. video without filename)
                 filename = f"{media_type_str}_{media.file_unique_id}"
             
             caption = message.caption or ""
@@ -155,6 +158,9 @@ async def worker(queue, bot, chat_id, stats):
             break
         
         if CANCEL:
+            # IMPORTANT: Even if cancelled, we mark task done, but we DO NOT increment processed
+            # to reflect that we skipped it. OR we increment to show progress?
+            # Let's NOT increment stats to show it stopped.
             queue.task_done()
             continue
 
@@ -162,14 +168,15 @@ async def worker(queue, bot, chat_id, stats):
             saved, dups = await fetch_and_save_batch(bot, chat_id, batch_ids)
             stats['saved'] += saved
             stats['dups'] += dups
-        except Exception:
-            pass
+            stats['processed'] += len(batch_ids) # Only increment if actually tried
+        except Exception as e:
+            logger.error(f"Worker Error: {e}")
         finally:
-            stats['processed'] += len(batch_ids)
             queue.task_done()
 
 async def index_files_to_db(last_msg_id: int, chat, msg: Message, bot: Client, start_from: int):
     global CANCEL
+    CANCEL = False # <--- CRITICAL FIX: Reset Cancel Flag
     start_time = time.time()
     
     stats = {'saved': 0, 'dups': 0, 'processed': 0}
@@ -289,24 +296,28 @@ async def send_for_index(bot: Client, message: Message):
         return await message.reply('❌ Invalid.')
 
     try:
-        chat = await bot.get_chat(chat_id)
+        # Permission Check
+        await bot.get_chat(chat_id)
     except:
         return await message.reply(f'❌ Cannot access chat.')
 
     s = await message.reply("Send skip number (0 for none).")
     msg_skip = await bot.listen(chat_id=message.chat.id, user_id=message.from_user.id)
     await s.delete()
-    skip = int(msg_skip.text)
+    try:
+        skip = int(msg_skip.text)
+    except:
+        skip = 0
 
     # --- RESET DB OPTION ---
     buttons = [
-        [InlineKeyboardButton('YES (CONTINUE)', callback_data=f'index#no#{chat.id}#{last_msg_id}#{skip}')],
-        [InlineKeyboardButton('YES (RESET DB)', callback_data=f'index#reset#{chat.id}#{last_msg_id}#{skip}')],
+        [InlineKeyboardButton('YES (CONTINUE)', callback_data=f'index#no#{chat_id}#{last_msg_id}#{skip}')],
+        [InlineKeyboardButton('YES (RESET DB)', callback_data=f'index#reset#{chat_id}#{last_msg_id}#{skip}')],
         [InlineKeyboardButton('CLOSE', callback_data='close_data')]
     ]
     await message.reply(
-        f'📝 **Index: {chat.title}**\nTotal: `{last_msg_id}`\n\n'
-        f'⚠️ **"RESET DB" will delete all existing data!**\nUse this if you see false duplicates.',
+        f'📝 **Index Request**\nTotal: `{last_msg_id}`\n\n'
+        f'⚠️ **"RESET DB" will delete all existing data!**\nUse this to fix "Duplicates" issues.',
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
