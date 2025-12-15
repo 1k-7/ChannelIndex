@@ -1,13 +1,13 @@
 # config.py
 
 # --- BOT CONFIGURATION ---
-API_ID = 1234567               # Your Telegram API ID
-API_HASH = "YOUR_API_HASH"     # Your Telegram API Hash
-BOT_TOKEN = "YOUR_BOT_TOKEN"   # Your Bot Token
-OWNER_ID = 123456789           # Your Telegram User ID (for command restriction)
+API_ID = 24574155               # Your Telegram API ID
+API_HASH = "94001be339d1264432c215f698bc3868"     # Your Telegram API Hash
+BOT_TOKEN = "8258848736:AAFfDwmgNrtuaC0k7x9DZdKECYs3SLR4HgE"   # Your Bot Token
+OWNER_ID = 7679063455           # Your Telegram User ID (for command restriction)
 
 # --- MONGODB CONFIGURATION ---
-MONGO_URI = "mongodb+srv://user:password@clustername.mongodb.net/?retryWrites=true&w=majority"
+MONGO_URI = "mongodb+srv://Chin:vq0AtXopWzmAJItl@cluster0.vcuudlg.mongodb.net/?appName=Cluster0"
 DATABASE_NAME = "ChannelBackupDB"
 COLLECTION_NAME = "channel_backup_files"
 
