@@ -8,7 +8,7 @@ from aiohttp import web, ClientSession
 from pyrogram import Client, filters, enums, idle, types
 from pyrogram.errors import FloodWait
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-import pyromod  # Fixes 'listen' attribute error
+import pyromod
 
 from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID, INDEX_EXTENSIONS
 from db_utils import db
@@ -20,51 +20,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- CUSTOM ITER_MESSAGES (Fixed 'iter_messages' error) ---
+# --- CUSTOM ITER_MESSAGES ---
 async def iter_messages(
     self: Client, 
     chat_id: Union[int, str], 
     limit: int, 
     offset: int = 0
 ) -> Optional[AsyncGenerator["types.Message", None]]:
-    """
-    Custom method to iterate messages sequentially using get_messages with ID lists.
-    Iterates from 'offset' (oldest) to 'limit' (newest).
-    """
     current = offset
     while True:
         new_diff = min(200, limit - current)
         if new_diff <= 0:
             return
         
-        # Create a list of message IDs to fetch in a batch
-        # range is exclusive at the end, so we add +1
         ids_to_fetch = list(range(current, current + new_diff + 1))
         
         try:
             messages = await self.get_messages(chat_id, ids_to_fetch)
         except Exception as e:
             logger.error(f"Error fetching messages {ids_to_fetch[0]}-{ids_to_fetch[-1]}: {e}")
-            # If we fail to get a batch, we increment current to avoid infinite loops, 
-            # effectively skipping this batch.
             current += new_diff
             continue
 
-        # Check if messages is None or empty (can happen if IDs don't exist)
         if not messages:
             current += new_diff
             continue
 
         for message in messages:
-            # get_messages might return None for deleted/non-existent IDs in the list
             if message:
                 yield message
         
         current += new_diff + 1
 
-# Monkey Patch: Add this method to the Pyrogram Client
 Client.iter_messages = iter_messages
-
 
 # --- WEB SERVER & SELF-PING ---
 routes = web.RouteTableDef()
@@ -79,26 +67,18 @@ async def web_server():
     return web_app
 
 async def auto_ping():
-    """Pings the bot's own Render URL every 10 minutes."""
     url = os.environ.get("RENDER_EXTERNAL_URL") 
+    if not url: return
+    if not url.startswith("http"): url = f"http://{url}"
     
-    if not url:
-        logger.warning("No RENDER_EXTERNAL_URL found. Self-ping disabled.")
-        return
-
-    if not url.startswith("http"):
-        url = f"http://{url}"
-        
     logger.info(f"Auto-ping started for URL: {url}")
-    
     while True:
         try:
             async with ClientSession() as session:
                 async with session.get(url) as resp:
-                    logger.info(f"Pinged {url} - Status: {resp.status}")
-        except Exception as e:
-            logger.error(f"Auto-ping failed: {e}")
-        
+                    pass
+        except:
+            pass
         await asyncio.sleep(600)
 
 # --- UTILS ---
@@ -137,7 +117,6 @@ async def index_files_to_db(lst_msg_id: int, chat, msg: Message, bot: Client, sk
     
     async with lock:
         try:
-            # Using the monkey-patched iter_messages
             async for message in bot.iter_messages(chat.id, lst_msg_id, skip):
                 
                 if CANCEL:
@@ -146,10 +125,10 @@ async def index_files_to_db(lst_msg_id: int, chat, msg: Message, bot: Client, sk
                     await msg.edit(f"🛑 **Cancelled!**\nSaved: {total_files}\nTime: {time_taken}")
                     return
 
-                current = message.id # Sync current with actual message ID
+                current = message.id 
                 
-                # Update status every 50 messages (reduced frequency to avoid floodwait)
-                if total_files % 50 == 0:
+                # Update status
+                if total_files > 0 and total_files % 50 == 0:
                     try:
                         btn = [[InlineKeyboardButton('CANCEL', callback_data=f'index#cancel')]]
                         await msg.edit_text(
@@ -171,25 +150,29 @@ async def index_files_to_db(lst_msg_id: int, chat, msg: Message, bot: Client, sk
                     no_media += 1
                     continue
                 
-                media_type = message.media.value
-                if media_type not in [enums.MessageMediaType.VIDEO, enums.MessageMediaType.DOCUMENT, enums.MessageMediaType.AUDIO]:
+                # --- FIX STARTS HERE ---
+                # Check the Enum directly, not the value string yet
+                if message.media not in [enums.MessageMediaType.VIDEO, enums.MessageMediaType.DOCUMENT, enums.MessageMediaType.AUDIO]:
                     unsupported += 1
                     continue
                 
-                media = getattr(message, media_type, None)
+                # Now get the attribute name string (e.g., "video", "document")
+                media_type_str = message.media.value
+                media = getattr(message, media_type_str, None)
+                
                 if not media:
                     unsupported += 1
                     continue
                 
                 # Extension Check
                 file_name = str(getattr(media, "file_name", "")).lower()
-                if not file_name.endswith(INDEX_EXTENSIONS):
-                    # Check if it's a video/audio without filename that we still want
-                    if media_type == enums.MessageMediaType.VIDEO and not file_name:
-                         pass # Allow unnamed videos
-                    else:
-                        unsupported += 1
-                        continue
+                
+                # Allow videos/audio even without filenames if they have the right type
+                # But if it HAS a filename, check the extension.
+                if file_name and not file_name.endswith(INDEX_EXTENSIONS):
+                    unsupported += 1
+                    continue
+                # --- FIX ENDS HERE ---
                 
                 sts = await db.save_file(message, media)
                 if sts == 'suc':
@@ -203,7 +186,6 @@ async def index_files_to_db(lst_msg_id: int, chat, msg: Message, bot: Client, sk
             logger.exception("Indexing loop error")
             await msg.reply(f'❌ Index canceled due to Error: `{e}`')
         
-        # Final Completion
         time_taken = get_readable_time(time.time() - start_time)
         await msg.edit(
             f'✅ **Indexing Complete!**\n'
@@ -245,7 +227,7 @@ async def start_command(client, message):
 @app.on_message(filters.command('index') & filters.private & filters.user(OWNER_ID))
 async def send_for_index(bot: Client, message: Message):
     if lock.locked():
-        return await message.reply('⚠️ A process is already running. Wait until it completes.')
+        return await message.reply('⚠️ A process is already running.')
     
     i = await message.reply("Forward the **last message** of the channel or send its link.")
     
@@ -267,8 +249,7 @@ async def send_for_index(bot: Client, message: Message):
             if chat_id.isnumeric():
                 chat_id = int(f"-100{chat_id}")
             else:
-                 # Handle username case (e.g., t.me/channelname/123)
-                 chat_id = chat_id 
+                 pass
         except:
             return await message.reply('❌ Invalid link!')
     elif msg_input.forward_from_chat and msg_input.forward_from_chat.type == enums.ChatType.CHANNEL:
@@ -311,11 +292,8 @@ async def index_files_callback(bot, query):
     elif query.data.startswith('index#yes#'):
         try:
             _, _, chat, lst_msg_id, skip = query.data.split("#")
-            # Ensure chat_id is integer
             chat_id = int(chat)
-            # Retrieve Chat object for title/etc (optional, but good for context)
             chat_obj = await bot.get_chat(chat_id)
-            
             await index_files_to_db(int(lst_msg_id), chat_obj, query.message, bot, int(skip))
         except Exception as e:
             logger.error(f"Callback error: {e}")
@@ -326,30 +304,20 @@ async def index_files_callback(bot, query):
 async def close_callback(bot, query):
     await query.message.delete()
 
-# --- MAIN EXECUTION ---
 if __name__ == "__main__":
     PORT = int(os.environ.get("PORT", 8080))
-    
     app_web = web.Application(client_max_size=30000000)
     app_web.add_routes(routes)
-
     async def start_services():
-        # Start Web Server
         runner = web.AppRunner(app_web)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", PORT)
         await site.start()
         logger.info(f"Web Server running on port {PORT}")
-
-        # Start Bot
         logger.info("Starting Bot...")
         await app.start()
-        
-        # Start Auto Ping Task
         asyncio.create_task(auto_ping())
-        
         await idle()
         await app.stop()
-
     loop = asyncio.get_event_loop()
     loop.run_until_complete(start_services())
