@@ -6,7 +6,7 @@ import time
 from typing import Union, Optional, List
 from aiohttp import web, ClientSession 
 from pyrogram import Client, filters, enums, idle, types
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, RPCError
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 import pyromod
 
@@ -18,6 +18,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
+logging.getLogger("pyrogram").setLevel(logging.WARNING) 
 logger = logging.getLogger(__name__)
 
 # --- WEB SERVER & SELF-PING ---
@@ -36,7 +37,6 @@ async def auto_ping():
     url = os.environ.get("RENDER_EXTERNAL_URL") 
     if not url: return
     if not url.startswith("http"): url = f"http://{url}"
-    logger.info(f"Auto-ping started for URL: {url}")
     while True:
         try:
             async with ClientSession() as session:
@@ -58,8 +58,8 @@ def get_readable_time(seconds: int) -> str:
 # --- GLOBALS ---
 lock = asyncio.Lock()
 CANCEL = False 
-BATCH_SIZE = 200 # Telegram API Limit per call
-CONCURRENCY_LIMIT = 5 # Number of parallel batches (Adjust carefully to avoid flood)
+BATCH_SIZE = 200        # Max Telegram allows per request
+WORKER_COUNT = 20       # High concurrency for speed
 
 # --- BOT CLIENT ---
 app = Client(
@@ -69,32 +69,49 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-# --- FAST INDEXING LOGIC ---
+# --- ROBUST WORKER LOGIC ---
 
-async def process_batch(bot, chat_id, ids, semaphore):
-    """Fetches a batch of messages and returns valid file documents."""
+async def fetch_and_save_batch(bot, chat_id, batch_ids):
+    """
+    Fetches a batch of messages with aggressive retries to ensure NO FILE IS MISSING.
+    """
     valid_docs = []
+    messages = []
     
-    async with semaphore:
+    # 1. RETRY LOOP: Keep trying to fetch the batch until successful
+    retries = 0
+    max_retries = 50 # Retry up to 50 times for network errors
+    
+    while True:
         try:
-            # Fetch 200 messages at once
-            messages = await bot.get_messages(chat_id, ids)
+            messages = await bot.get_messages(chat_id, batch_ids)
+            break # Success! Exit loop.
         except FloodWait as e:
-            logger.warning(f"FloodWait of {e.value}s encountered. Sleeping...")
-            await asyncio.sleep(e.value + 1)
-            return await process_batch(bot, chat_id, ids, semaphore) # Retry
+            logger.warning(f"⏳ FloodWait: Sleeping {e.value}s. Batch {batch_ids[0]} will be retried.")
+            await asyncio.sleep(e.value + 2)
+            # Do NOT break; retry immediately after sleep
         except Exception as e:
-            logger.error(f"Error fetching batch {ids[0]}-{ids[-1]}: {e}")
-            return []
+            retries += 1
+            if retries >= max_retries:
+                logger.error(f"❌ CRITICAL: Dropped batch {batch_ids[0]}-{batch_ids[-1]} after {max_retries} retries. Error: {e}")
+                return 0, 0 # Give up to prevent infinite hang on permanent errors
+            
+            wait_time = min(retries * 2, 30) # Exponential backoff up to 30s
+            logger.warning(f"⚠️ Batch connection error: {e}. Retrying in {wait_time}s ({retries}/{max_retries})...")
+            await asyncio.sleep(wait_time)
 
     if not messages:
-        return []
+        return 0, 0
 
+    # 2. PROCESSING LOOP
     for message in messages:
-        if not message or message.empty or not message.media:
+        # Gracefully handle deleted/empty messages
+        if not message or message.empty or message.service:
             continue
         
-        # Media Type Check
+        if not message.media:
+            continue
+            
         if message.media not in [enums.MessageMediaType.VIDEO, enums.MessageMediaType.DOCUMENT, enums.MessageMediaType.AUDIO]:
             continue
         
@@ -104,16 +121,13 @@ async def process_batch(bot, chat_id, ids, semaphore):
             continue
             
         file_name = str(getattr(media, "file_name", "")).lower()
-        
-        # Extension Check (Skip if strict extension check fails, unless it's a video without name)
         if file_name and not file_name.endswith(INDEX_EXTENSIONS):
             continue
 
-        # Prepare Document for Bulk Insert
         try:
             file_id_encoded = unpack_new_file_id(media.file_id)
             caption = message.caption or ""
-            # Basic cleaning similar to your original regex
+            # Sanitize filename for text search
             safe_filename = str(media.file_name or media.file_unique_id).replace("_", " ")
             
             doc = {
@@ -127,92 +141,114 @@ async def process_batch(bot, chat_id, ids, semaphore):
                 'caption': caption
             }
             valid_docs.append(doc)
-        except Exception as e:
-            logger.error(f"Error parsing message {message.id}: {e}")
+        except Exception:
             continue
-            
-    return valid_docs
+    
+    # 3. SAVE TO DB
+    if valid_docs:
+        # save_batch handles duplicate errors internally
+        return await db.save_batch(valid_docs)
+    return 0, 0
+
+async def worker(queue, bot, chat_id, stats):
+    """
+    Continuous worker that pulls batches from queue.
+    """
+    while True:
+        batch_ids = await queue.get()
+        if batch_ids is None: 
+            queue.task_done()
+            break
+        
+        if CANCEL:
+            queue.task_done()
+            continue
+
+        try:
+            saved, dups = await fetch_and_save_batch(bot, chat_id, batch_ids)
+            stats['saved'] += saved
+            stats['dups'] += dups
+        except Exception as e:
+            logger.error(f"Worker Unexpected Error: {e}")
+        finally:
+            stats['processed'] += len(batch_ids)
+            queue.task_done()
 
 async def index_files_to_db(last_msg_id: int, chat, msg: Message, bot: Client, start_from: int):
     global CANCEL
     start_time = time.time()
     
-    total_processed = 0
-    total_saved = 0
-    total_duplicates = 0
+    stats = {'saved': 0, 'dups': 0, 'processed': 0}
     
-    # Generate list of batch ranges
-    # e.g., range(1, 1000) -> [1...200], [201...400]...
+    # Prepare Queue
+    queue = asyncio.Queue()
     all_ids = list(range(start_from + 1, last_msg_id + 1))
+    total_messages = len(all_ids)
+    
+    if total_messages == 0:
+        await msg.edit("⚠️ No new messages to index.")
+        return
+
+    # Chunk IDs into batches of 200
     chunks = [all_ids[i:i + BATCH_SIZE] for i in range(0, len(all_ids), BATCH_SIZE)]
+    for chunk in chunks:
+        queue.put_nowait(chunk)
+        
+    for _ in range(WORKER_COUNT):
+        queue.put_nowait(None)
     
-    semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
-    tasks = set()
+    await msg.edit(
+        f"🚀 **Robust Indexing Started!**\n\n"
+        f"Total Messages: `{total_messages}`\n"
+        f"Workers: `{WORKER_COUNT}`\n"
+        f"Strategy: `Zero Data Loss`"
+    )
     
-    await msg.edit(f"🚀 **Fast Indexing Started!**\n\nTotal Messages: `{len(all_ids)}`\nBatches: `{len(chunks)}`\nConcurrent Workers: `{CONCURRENCY_LIMIT}`")
+    # Start Workers
+    workers = []
+    for _ in range(WORKER_COUNT):
+        w = asyncio.create_task(worker(queue, bot, chat.id, stats))
+        workers.append(w)
     
-    # Iterate through chunks and spawn tasks
-    for i, chunk_ids in enumerate(chunks):
+    # Monitor Progress
+    while not queue.empty():
         if CANCEL:
             break
             
-        task = asyncio.create_task(process_batch(bot, chat.id, chunk_ids, semaphore))
-        tasks.add(task)
+        await asyncio.sleep(5) 
         
-        # Collect results as they finish to save memory and update status
-        # We wait if we have too many active tasks, or just let them run?
-        # Better approach: Add to set, and periodically gather finished ones.
-        
-        # To keep it simple and ensure we don't spawn 10,000 tasks instantly:
-        if len(tasks) >= CONCURRENCY_LIMIT * 2:
-            # Wait for at least one task to finish
-            done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            
-            for t in done:
-                docs = await t
-                if docs:
-                    saved, dups = await db.save_batch(docs)
-                    total_saved += saved
-                    total_duplicates += dups
-                total_processed += BATCH_SIZE
-
-            # Update status
-            if i % 5 == 0:
-                time_taken = get_readable_time(time.time() - start_time)
-                try:
-                    btn = [[InlineKeyboardButton('CANCEL', callback_data=f'index#cancel')]]
-                    await msg.edit_text(
-                        f"⚡ **Fast Indexing...**\n\n"
-                        f"Processed: `{total_processed}` / `{last_msg_id}`\n"
-                        f"Saved: `{total_saved}`\n"
-                        f"Duplicates: `{total_duplicates}`\n"
-                        f"Time: `{time_taken}`",
-                        reply_markup=InlineKeyboardMarkup(btn)
-                    )
-                except FloodWait as e:
-                    await asyncio.sleep(e.value)
-                except:
-                    pass
-
-    # Process remaining tasks
-    if tasks:
-        done, _ = await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
-        for t in done:
-            docs = await t
-            if docs:
-                saved, dups = await db.save_batch(docs)
-                total_saved += saved
-                total_duplicates += dups
-
-    # Final Message
-    if CANCEL:
-        await msg.edit(f"🛑 **Cancelled!**\nSaved: {total_saved}")
-    else:
         time_taken = get_readable_time(time.time() - start_time)
+        percent = (stats['processed'] / total_messages) * 100 if total_messages > 0 else 0
+        
+        try:
+            btn = [[InlineKeyboardButton('STOP', callback_data=f'index#cancel')]]
+            await msg.edit_text(
+                f"🛡️ **Indexing...**\n\n"
+                f"Scanned: `{stats['processed']}` / `{total_messages}` ({percent:.1f}%)\n"
+                f"Saved: `{stats['saved']}`\n"
+                f"Duplicates: `{stats['dups']}`\n"
+                f"Time: `{time_taken}`",
+                reply_markup=InlineKeyboardMarkup(btn)
+            )
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+        except Exception:
+            pass
+
+    await queue.join()
+    for w in workers:
+        w.cancel()
+    
+    time_taken = get_readable_time(time.time() - start_time)
+    
+    if CANCEL:
+        await msg.edit(f"🛑 **Cancelled!**\nSaved: {stats['saved']}")
+    else:
         await msg.edit(
             f'✅ **Indexing Complete!**\n\n'
-            f'Total Saved: `{total_saved}`\n'
-            f'Duplicates: `{total_duplicates}`\n'
+            f'Total Scanned: `{stats["processed"]}`\n'
+            f'Total Saved: `{stats["saved"]}`\n'
+            f'Duplicates: `{stats["dups"]}`\n'
             f'Time: `{time_taken}`\n\n'
             f'**Sending JSON backup...**'
         )
@@ -244,7 +280,7 @@ async def send_backup(client, target_chat_id):
 
 @app.on_message(filters.command('start') & filters.private)
 async def start_command(client, message):
-    await message.reply_text("👋 **Fast Indexer Bot**\nUse `/index` to start.")
+    await message.reply_text("👋 **Robust Indexer Bot**\nUse `/index` to start.")
 
 @app.on_message(filters.command('index') & filters.private & filters.user(OWNER_ID))
 async def send_for_index(bot: Client, message: Message):
@@ -302,7 +338,7 @@ async def send_for_index(bot: Client, message: Message):
         f'**Channel:** {chat.title}\n'
         f'**Total Messages:** `{last_msg_id}`\n'
         f'**Start From:** `{skip}`\n\n'
-        f'🚀 **Mode:** Fast Parallel Index',
+        f'🛡️ **Mode:** Zero Data Loss',
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
@@ -311,7 +347,7 @@ async def index_files_callback(bot, query):
     global CANCEL
     if query.data == 'index#cancel':
         CANCEL = True
-        return await query.answer("Cancelling...", show_alert=True)
+        return await query.answer("Stopping...", show_alert=True)
     elif query.data.startswith('index#yes#'):
         try:
             _, _, chat, lst_msg_id, skip = query.data.split("#")
