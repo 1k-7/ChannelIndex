@@ -3,7 +3,7 @@ import json
 import asyncio
 import logging
 import time
-from typing import Union, Optional, AsyncGenerator
+from typing import Union, Optional, List
 from aiohttp import web, ClientSession 
 from pyrogram import Client, filters, enums, idle, types
 from pyrogram.errors import FloodWait
@@ -11,7 +11,7 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 import pyromod
 
 from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID, INDEX_EXTENSIONS
-from db_utils import db
+from db_utils import db, unpack_new_file_id
 
 # --- LOGGING SETUP ---
 logging.basicConfig(
@@ -19,40 +19,6 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-# --- CUSTOM ITER_MESSAGES ---
-async def iter_messages(
-    self: Client, 
-    chat_id: Union[int, str], 
-    limit: int, 
-    offset: int = 0
-) -> Optional[AsyncGenerator["types.Message", None]]:
-    current = offset
-    while True:
-        new_diff = min(200, limit - current)
-        if new_diff <= 0:
-            return
-        
-        ids_to_fetch = list(range(current, current + new_diff + 1))
-        
-        try:
-            messages = await self.get_messages(chat_id, ids_to_fetch)
-        except Exception as e:
-            logger.error(f"Error fetching messages {ids_to_fetch[0]}-{ids_to_fetch[-1]}: {e}")
-            current += new_diff
-            continue
-
-        if not messages:
-            current += new_diff
-            continue
-
-        for message in messages:
-            if message:
-                yield message
-        
-        current += new_diff + 1
-
-Client.iter_messages = iter_messages
 
 # --- WEB SERVER & SELF-PING ---
 routes = web.RouteTableDef()
@@ -70,7 +36,6 @@ async def auto_ping():
     url = os.environ.get("RENDER_EXTERNAL_URL") 
     if not url: return
     if not url.startswith("http"): url = f"http://{url}"
-    
     logger.info(f"Auto-ping started for URL: {url}")
     while True:
         try:
@@ -83,8 +48,7 @@ async def auto_ping():
 
 # --- UTILS ---
 def get_readable_time(seconds: int) -> str:
-    time_list = []
-    time_list.extend([int(seconds / 86400), int(seconds / 3600) % 24, int(seconds / 60) % 60, int(seconds) % 60])
+    time_list = [int(seconds / 86400), int(seconds / 3600) % 24, int(seconds / 60) % 60, int(seconds) % 60]
     up_time = ""
     for i, j in enumerate(time_list):
         if j != 0:
@@ -94,6 +58,8 @@ def get_readable_time(seconds: int) -> str:
 # --- GLOBALS ---
 lock = asyncio.Lock()
 CANCEL = False 
+BATCH_SIZE = 200 # Telegram API Limit per call
+CONCURRENCY_LIMIT = 5 # Number of parallel batches (Adjust carefully to avoid flood)
 
 # --- BOT CLIENT ---
 app = Client(
@@ -103,99 +69,155 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-# --- CORE INDEXING FUNCTION ---
-async def index_files_to_db(lst_msg_id: int, chat, msg: Message, bot: Client, skip: int):
+# --- FAST INDEXING LOGIC ---
+
+async def process_batch(bot, chat_id, ids, semaphore):
+    """Fetches a batch of messages and returns valid file documents."""
+    valid_docs = []
+    
+    async with semaphore:
+        try:
+            # Fetch 200 messages at once
+            messages = await bot.get_messages(chat_id, ids)
+        except FloodWait as e:
+            logger.warning(f"FloodWait of {e.value}s encountered. Sleeping...")
+            await asyncio.sleep(e.value + 1)
+            return await process_batch(bot, chat_id, ids, semaphore) # Retry
+        except Exception as e:
+            logger.error(f"Error fetching batch {ids[0]}-{ids[-1]}: {e}")
+            return []
+
+    if not messages:
+        return []
+
+    for message in messages:
+        if not message or message.empty or not message.media:
+            continue
+        
+        # Media Type Check
+        if message.media not in [enums.MessageMediaType.VIDEO, enums.MessageMediaType.DOCUMENT, enums.MessageMediaType.AUDIO]:
+            continue
+        
+        media_type_str = message.media.value
+        media = getattr(message, media_type_str, None)
+        if not media:
+            continue
+            
+        file_name = str(getattr(media, "file_name", "")).lower()
+        
+        # Extension Check (Skip if strict extension check fails, unless it's a video without name)
+        if file_name and not file_name.endswith(INDEX_EXTENSIONS):
+            continue
+
+        # Prepare Document for Bulk Insert
+        try:
+            file_id_encoded = unpack_new_file_id(media.file_id)
+            caption = message.caption or ""
+            # Basic cleaning similar to your original regex
+            safe_filename = str(media.file_name or media.file_unique_id).replace("_", " ")
+            
+            doc = {
+                '_id': file_id_encoded,
+                'file_name': safe_filename,
+                'file_size': media.file_size,
+                'file_id_tg': media.file_id,
+                'file_unique_id': media.file_unique_id,
+                'message_id': message.id,
+                'chat_id': message.chat.id,
+                'caption': caption
+            }
+            valid_docs.append(doc)
+        except Exception as e:
+            logger.error(f"Error parsing message {message.id}: {e}")
+            continue
+            
+    return valid_docs
+
+async def index_files_to_db(last_msg_id: int, chat, msg: Message, bot: Client, start_from: int):
     global CANCEL
     start_time = time.time()
-    total_files = 0
-    duplicate = 0
-    errors = 0
-    deleted = 0
-    no_media = 0
-    unsupported = 0
-    current = skip
     
-    async with lock:
-        try:
-            async for message in bot.iter_messages(chat.id, lst_msg_id, skip):
-                
-                if CANCEL:
-                    CANCEL = False
-                    time_taken = get_readable_time(time.time() - start_time)
-                    await msg.edit(f"🛑 **Cancelled!**\nSaved: {total_files}\nTime: {time_taken}")
-                    return
-
-                current = message.id 
-                
-                # Update status
-                if total_files > 0 and total_files % 50 == 0:
-                    try:
-                        btn = [[InlineKeyboardButton('CANCEL', callback_data=f'index#cancel')]]
-                        await msg.edit_text(
-                            text=f"**Indexing...**\n"
-                                 f"Msg ID: `{current}` / `{lst_msg_id}`\n"
-                                 f"Saved: `{total_files}`\n"
-                                 f"Errors: `{errors}`", 
-                            reply_markup=InlineKeyboardMarkup(btn)
-                        )
-                    except FloodWait as e:
-                        await asyncio.sleep(e.value)
-                    except:
-                        pass 
-
-                if message.empty:
-                    deleted += 1
-                    continue
-                elif not message.media:
-                    no_media += 1
-                    continue
-                
-                # --- FIX STARTS HERE ---
-                # Check the Enum directly, not the value string yet
-                if message.media not in [enums.MessageMediaType.VIDEO, enums.MessageMediaType.DOCUMENT, enums.MessageMediaType.AUDIO]:
-                    unsupported += 1
-                    continue
-                
-                # Now get the attribute name string (e.g., "video", "document")
-                media_type_str = message.media.value
-                media = getattr(message, media_type_str, None)
-                
-                if not media:
-                    unsupported += 1
-                    continue
-                
-                # Extension Check
-                file_name = str(getattr(media, "file_name", "")).lower()
-                
-                # Allow videos/audio even without filenames if they have the right type
-                # But if it HAS a filename, check the extension.
-                if file_name and not file_name.endswith(INDEX_EXTENSIONS):
-                    unsupported += 1
-                    continue
-                # --- FIX ENDS HERE ---
-                
-                sts = await db.save_file(message, media)
-                if sts == 'suc':
-                    total_files += 1
-                elif sts == 'dup':
-                    duplicate += 1
-                elif sts == 'err':
-                    errors += 1
-
-        except Exception as e:
-            logger.exception("Indexing loop error")
-            await msg.reply(f'❌ Index canceled due to Error: `{e}`')
+    total_processed = 0
+    total_saved = 0
+    total_duplicates = 0
+    
+    # Generate list of batch ranges
+    # e.g., range(1, 1000) -> [1...200], [201...400]...
+    all_ids = list(range(start_from + 1, last_msg_id + 1))
+    chunks = [all_ids[i:i + BATCH_SIZE] for i in range(0, len(all_ids), BATCH_SIZE)]
+    
+    semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
+    tasks = set()
+    
+    await msg.edit(f"🚀 **Fast Indexing Started!**\n\nTotal Messages: `{len(all_ids)}`\nBatches: `{len(chunks)}`\nConcurrent Workers: `{CONCURRENCY_LIMIT}`")
+    
+    # Iterate through chunks and spawn tasks
+    for i, chunk_ids in enumerate(chunks):
+        if CANCEL:
+            break
+            
+        task = asyncio.create_task(process_batch(bot, chat.id, chunk_ids, semaphore))
+        tasks.add(task)
         
+        # Collect results as they finish to save memory and update status
+        # We wait if we have too many active tasks, or just let them run?
+        # Better approach: Add to set, and periodically gather finished ones.
+        
+        # To keep it simple and ensure we don't spawn 10,000 tasks instantly:
+        if len(tasks) >= CONCURRENCY_LIMIT * 2:
+            # Wait for at least one task to finish
+            done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            
+            for t in done:
+                docs = await t
+                if docs:
+                    saved, dups = await db.save_batch(docs)
+                    total_saved += saved
+                    total_duplicates += dups
+                total_processed += BATCH_SIZE
+
+            # Update status
+            if i % 5 == 0:
+                time_taken = get_readable_time(time.time() - start_time)
+                try:
+                    btn = [[InlineKeyboardButton('CANCEL', callback_data=f'index#cancel')]]
+                    await msg.edit_text(
+                        f"⚡ **Fast Indexing...**\n\n"
+                        f"Processed: `{total_processed}` / `{last_msg_id}`\n"
+                        f"Saved: `{total_saved}`\n"
+                        f"Duplicates: `{total_duplicates}`\n"
+                        f"Time: `{time_taken}`",
+                        reply_markup=InlineKeyboardMarkup(btn)
+                    )
+                except FloodWait as e:
+                    await asyncio.sleep(e.value)
+                except:
+                    pass
+
+    # Process remaining tasks
+    if tasks:
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
+        for t in done:
+            docs = await t
+            if docs:
+                saved, dups = await db.save_batch(docs)
+                total_saved += saved
+                total_duplicates += dups
+
+    # Final Message
+    if CANCEL:
+        await msg.edit(f"🛑 **Cancelled!**\nSaved: {total_saved}")
+    else:
         time_taken = get_readable_time(time.time() - start_time)
         await msg.edit(
-            f'✅ **Indexing Complete!**\n'
-            f'Saved: `{total_files}`\n'
-            f'Duplicates: `{duplicate}`\n'
+            f'✅ **Indexing Complete!**\n\n'
+            f'Total Saved: `{total_saved}`\n'
+            f'Duplicates: `{total_duplicates}`\n'
             f'Time: `{time_taken}`\n\n'
             f'**Sending JSON backup...**'
         )
         await send_backup(bot, msg.chat.id)
-        
+
 async def send_backup(client, target_chat_id):
     file_path = "channel_backup.json"
     try:
@@ -222,7 +244,7 @@ async def send_backup(client, target_chat_id):
 
 @app.on_message(filters.command('start') & filters.private)
 async def start_command(client, message):
-    await message.reply_text("👋 **Channel Index & Backup Bot**\nUse `/index` to start.")
+    await message.reply_text("👋 **Fast Indexer Bot**\nUse `/index` to start.")
 
 @app.on_message(filters.command('index') & filters.private & filters.user(OWNER_ID))
 async def send_for_index(bot: Client, message: Message):
@@ -261,9 +283,9 @@ async def send_for_index(bot: Client, message: Message):
     try:
         chat = await bot.get_chat(chat_id)
     except:
-        return await message.reply(f'❌ Error: Cannot access chat `{chat_id}`.\nMake sure I am added as an **Admin** there.')
+        return await message.reply(f'❌ Error: Cannot access chat `{chat_id}`.')
 
-    s = await message.reply("Send skip message number (Send `0` to start from beginning).")
+    s = await message.reply("Send skip message number (0 for none).")
     msg_skip = await bot.listen(chat_id=message.chat.id, user_id=message.from_user.id)
     await s.delete()
     try:
@@ -279,7 +301,8 @@ async def send_for_index(bot: Client, message: Message):
         f'📝 **Index Request**\n\n'
         f'**Channel:** {chat.title}\n'
         f'**Total Messages:** `{last_msg_id}`\n'
-        f'**Start From:** `{skip}`', 
+        f'**Start From:** `{skip}`\n\n'
+        f'🚀 **Mode:** Fast Parallel Index',
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
