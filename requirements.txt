@@ -1,3 +1,5 @@
 pyrogram
 motor
 tgcrypto
+pyromod
+aiohttp
