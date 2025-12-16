@@ -3,6 +3,7 @@ import json
 import asyncio
 import logging
 import time
+import re
 from typing import Union, Optional, List
 from aiohttp import web, ClientSession 
 from pyrogram import Client, filters, enums, idle, types
@@ -10,7 +11,7 @@ from pyrogram.errors import FloodWait, RPCError
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 import pyromod
 
-from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID
+from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID, INDEX_EXTENSIONS
 from db_utils import db, unpack_new_file_id
 
 # --- LOGGING SETUP ---
@@ -59,7 +60,7 @@ def get_readable_time(seconds: int) -> str:
 lock = asyncio.Lock()
 CANCEL = False 
 BATCH_SIZE = 200
-WORKER_COUNT = 20 
+WORKER_COUNT = 15 # Balanced speed to avoid "breaking" pipe
 
 # --- BOT CLIENT ---
 app = Client(
@@ -69,19 +70,21 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-# --- WORKER LOGIC ---
+# --- REFERENCE LOGIC WORKER ---
 
-async def fetch_and_save_batch(bot, chat_id, batch_ids):
+async def fetch_and_process_batch(bot, chat_id, batch_ids):
     """
-    Fetches a batch of messages with NO FILTERS (Saves Everything).
+    Fetches messages and applies index.py logic.
+    Returns: (valid_docs, stats_increment)
     """
     valid_docs = []
+    # Local stats for this batch
+    s = {'deleted': 0, 'no_media': 0, 'unsupported': 0, 'processed': 0}
+    
     messages = []
-    
-    # Retry Loop for Network/FloodWait
     retries = 0
-    max_retries = 10
     
+    # Reliable Fetch Loop
     while True:
         try:
             messages = await bot.get_messages(chat_id, batch_ids)
@@ -90,67 +93,83 @@ async def fetch_and_save_batch(bot, chat_id, batch_ids):
             await asyncio.sleep(e.value + 2)
         except Exception as e:
             retries += 1
-            if retries >= max_retries:
-                logger.error(f"Dropped batch {batch_ids[0]}-{batch_ids[-1]}: {e}")
-                return 0, 0 
-            await asyncio.sleep(min(retries, 5))
+            if retries >= 5:
+                # If we fail 5 times, assume these IDs are inaccessible or deleted
+                s['deleted'] += len(batch_ids) 
+                return [], s
+            await asyncio.sleep(1)
 
     if not messages:
-        return 0, 0
+        s['deleted'] += len(batch_ids)
+        return [], s
+
+    s['processed'] = len(messages)
 
     for message in messages:
-        # Skip only truly empty/service messages
+        # 1. Check Empty/Service (Reference Logic)
         if not message or message.empty or message.service:
+            s['deleted'] += 1
             continue
         
-        # Must have ANY media
+        # 2. Check Media Existence (Reference Logic)
         if not message.media:
+            s['no_media'] += 1
             continue
             
-        # Get Media Object (Video, Doc, Audio)
-        # Note: We skip PHOTOS to prevent database spam, but include all files.
+        # 3. Check Media Type (Reference Logic + Audio)
+        # index.py checks [VIDEO, DOCUMENT]. We include AUDIO to be safe, but exclude PHOTO.
         if message.media not in [enums.MessageMediaType.VIDEO, enums.MessageMediaType.DOCUMENT, enums.MessageMediaType.AUDIO]:
+            s['unsupported'] += 1
             continue
 
-        media_type_str = message.media.value
-        media = getattr(message, media_type_str, None)
+        media = getattr(message, message.media.value, None)
         if not media:
+            s['unsupported'] += 1
             continue
 
-        # --- NO EXTENSION FILTER APPLIED --- 
+        # 4. Check Extensions (Reference Logic)
+        # If user wants NO missing files, they must ensure INDEX_EXTENSIONS in config.py is comprehensive.
+        file_name = getattr(media, "file_name", "")
+        if not file_name:
+             # Logic from ia_filterdb.py: fallbacks if needed, or skip?
+             # Reference usually skips if no extension match.
+             # We will be slightly lenient: if no name but is video, we keep it.
+             if message.media == enums.MessageMediaType.VIDEO:
+                 file_name = f"video_{media.file_unique_id}.mp4"
+             else:
+                 s['unsupported'] += 1
+                 continue
+        
+        # Clean filename logic from ia_filterdb.py
+        # re.sub(r"@\w+|(_|\-|\.|\+)", " ", str(media.file_name))
+        clean_name = re.sub(r"@\w+|(_|\-|\.|\+)", " ", str(file_name))
+        
+        # Check Extension
+        if not str(file_name).lower().endswith(tuple(INDEX_EXTENSIONS)):
+            s['unsupported'] += 1
+            continue
         
         try:
-            # Try to unpack file_id. If fails, skip.
+            # Unpack ID (Reference Logic)
             file_id_encoded = unpack_new_file_id(media.file_id)
-            
-            # Determine filename
-            filename = getattr(media, "file_name", None)
-            if not filename:
-                # Fallback for unnamed media (e.g. video without filename)
-                filename = f"{media_type_str}_{media.file_unique_id}"
-            
-            caption = message.caption or ""
-            safe_filename = str(filename).replace("_", " ")
             
             doc = {
                 '_id': file_id_encoded,
-                'file_name': safe_filename,
+                'file_name': clean_name.strip(),
                 'file_size': getattr(media, "file_size", 0),
                 'file_id_tg': media.file_id,
                 'file_unique_id': media.file_unique_id,
                 'message_id': message.id,
                 'chat_id': message.chat.id,
-                'caption': caption
+                'caption': (message.caption or "")
             }
             valid_docs.append(doc)
         except Exception:
             continue
-    
-    if valid_docs:
-        return await db.save_batch(valid_docs)
-    return 0, 0
+            
+    return valid_docs, s
 
-async def worker(queue, bot, chat_id, stats):
+async def worker(queue, bot, chat_id, global_stats):
     while True:
         batch_ids = await queue.get()
         if batch_ids is None: 
@@ -158,34 +177,44 @@ async def worker(queue, bot, chat_id, stats):
             break
         
         if CANCEL:
-            # IMPORTANT: Even if cancelled, we mark task done, but we DO NOT increment processed
-            # to reflect that we skipped it. OR we increment to show progress?
-            # Let's NOT increment stats to show it stopped.
             queue.task_done()
             continue
 
         try:
-            saved, dups = await fetch_and_save_batch(bot, chat_id, batch_ids)
-            stats['saved'] += saved
-            stats['dups'] += dups
-            stats['processed'] += len(batch_ids) # Only increment if actually tried
+            docs, s = await fetch_and_process_batch(bot, chat_id, batch_ids)
+            
+            # Update Global Stats
+            global_stats['processed'] += s['processed']
+            global_stats['deleted'] += s['deleted']
+            global_stats['no_media'] += s['no_media']
+            global_stats['unsupported'] += s['unsupported']
+            
+            if docs:
+                saved, dups = await db.save_batch(docs)
+                global_stats['saved'] += saved
+                global_stats['dups'] += dups
+                
         except Exception as e:
-            logger.error(f"Worker Error: {e}")
+            logger.error(f"Worker Exception: {e}")
         finally:
             queue.task_done()
 
 async def index_files_to_db(last_msg_id: int, chat, msg: Message, bot: Client, start_from: int):
     global CANCEL
-    CANCEL = False # <--- CRITICAL FIX: Reset Cancel Flag
+    CANCEL = False
     start_time = time.time()
     
-    stats = {'saved': 0, 'dups': 0, 'processed': 0}
+    # Detailed Stats Tracking
+    stats = {
+        'saved': 0, 'dups': 0, 'processed': 0,
+        'deleted': 0, 'no_media': 0, 'unsupported': 0
+    }
     
     queue = asyncio.Queue()
     all_ids = list(range(start_from + 1, last_msg_id + 1))
-    total_messages = len(all_ids)
+    total_msgs = len(all_ids)
     
-    if total_messages == 0:
+    if total_msgs == 0:
         await msg.edit("⚠️ No messages to index.")
         return
 
@@ -193,38 +222,37 @@ async def index_files_to_db(last_msg_id: int, chat, msg: Message, bot: Client, s
     chunks = [all_ids[i:i + BATCH_SIZE] for i in range(0, len(all_ids), BATCH_SIZE)]
     for chunk in chunks:
         queue.put_nowait(chunk)
-        
     for _ in range(WORKER_COUNT):
         queue.put_nowait(None)
     
     await msg.edit(
-        f"🚀 **Full Index Started**\n"
-        f"Total: `{total_messages}`\n"
-        f"Filters: `DISABLED (All Files)`\n"
-        f"Mode: `Zero Loss`"
+        f"🚀 **Indexing Started**\n"
+        f"Messages: `{total_msgs}`\n"
+        f"Workers: `{WORKER_COUNT}`"
     )
     
-    workers = []
-    for _ in range(WORKER_COUNT):
-        w = asyncio.create_task(worker(queue, bot, chat.id, stats))
-        workers.append(w)
+    workers = [asyncio.create_task(worker(queue, bot, chat.id, stats)) for _ in range(WORKER_COUNT)]
     
-    # Progress Loop
+    # UI Loop
     while not queue.empty():
-        if CANCEL:
-            break
-        await asyncio.sleep(4) 
+        if CANCEL: break
+        await asyncio.sleep(5)
         
         time_taken = get_readable_time(time.time() - start_time)
-        percent = (stats['processed'] / total_messages) * 100 if total_messages > 0 else 0
+        # Calculate percentage based on Processed + Deleted (Total IDs handled)
+        total_handled = stats['processed'] + stats['deleted']
+        percent = (total_handled / total_msgs) * 100 if total_msgs > 0 else 0
         
         try:
             btn = [[InlineKeyboardButton('STOP', callback_data=f'index#cancel')]]
             await msg.edit_text(
-                f"🛡️ **Indexing...**\n\n"
-                f"Scanned: `{stats['processed']}` / `{total_messages}` ({percent:.1f}%)\n"
-                f"Saved: `{stats['saved']}`\n"
-                f"Duplicates: `{stats['dups']}`\n"
+                f"🛡️ **Status:**\n"
+                f"Total Scanned: `{total_handled}` / `{total_msgs}` ({percent:.1f}%)\n"
+                f"✅ Saved: `{stats['saved']}`\n"
+                f"♻️ Duplicates: `{stats['dups']}`\n"
+                f"🗑️ Deleted/Empty: `{stats['deleted']}`\n"
+                f"🚫 No Media: `{stats['no_media']}`\n"
+                f"⚠️ Unsupported: `{stats['unsupported']}`\n"
                 f"Time: `{time_taken}`",
                 reply_markup=InlineKeyboardMarkup(btn)
             )
@@ -236,12 +264,13 @@ async def index_files_to_db(last_msg_id: int, chat, msg: Message, bot: Client, s
     
     time_taken = get_readable_time(time.time() - start_time)
     await msg.edit(
-        f'✅ **Complete!**\n'
-        f'Scanned: `{stats["processed"]}`\n'
-        f'Saved: `{stats["saved"]}`\n'
-        f'Duplicates: `{stats["dups"]}`\n'
-        f'Time: `{time_taken}`\n\n'
-        f'**Sending JSON...**'
+        f"✅ **Indexing Complete!**\n\n"
+        f"Saved: `{stats['saved']}`\n"
+        f"Duplicates: `{stats['dups']}`\n"
+        f"Deleted/Empty: `{stats['deleted']}`\n"
+        f"Other Media: `{stats['unsupported'] + stats['no_media']}`\n"
+        f"Time: `{time_taken}`\n\n"
+        f"**Preparing Backup...**"
     )
     await send_backup(bot, msg.chat.id)
 
@@ -250,7 +279,7 @@ async def send_backup(client, target_chat_id):
     try:
         data = await db.get_all_data()
         if not data:
-            return await client.send_message(target_chat_id, "⚠️ No data found.")
+            return await client.send_message(target_chat_id, "⚠️ Database is empty.")
         
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
@@ -258,7 +287,7 @@ async def send_backup(client, target_chat_id):
         await client.send_document(
             chat_id=target_chat_id, 
             document=file_path, 
-            caption=f"📦 **Backup**\nRecords: `{len(data)}`"
+            caption=f"📦 **Backup**\nFiles: `{len(data)}`"
         )
     except Exception as e:
         logger.error(f"Backup error: {e}")
@@ -269,7 +298,7 @@ async def send_backup(client, target_chat_id):
 
 @app.on_message(filters.command('start') & filters.private)
 async def start_command(client, message):
-    await message.reply_text("👋 **Zero-Loss Indexer**\nUse `/index` to start.")
+    await message.reply_text("👋 **Reference Logic Indexer**\nUse `/index` to start.")
 
 @app.on_message(filters.command('index') & filters.private & filters.user(OWNER_ID))
 async def send_for_index(bot: Client, message: Message):
@@ -296,7 +325,6 @@ async def send_for_index(bot: Client, message: Message):
         return await message.reply('❌ Invalid.')
 
     try:
-        # Permission Check
         await bot.get_chat(chat_id)
     except:
         return await message.reply(f'❌ Cannot access chat.')
@@ -309,15 +337,14 @@ async def send_for_index(bot: Client, message: Message):
     except:
         skip = 0
 
-    # --- RESET DB OPTION ---
     buttons = [
         [InlineKeyboardButton('YES (CONTINUE)', callback_data=f'index#no#{chat_id}#{last_msg_id}#{skip}')],
         [InlineKeyboardButton('YES (RESET DB)', callback_data=f'index#reset#{chat_id}#{last_msg_id}#{skip}')],
         [InlineKeyboardButton('CLOSE', callback_data='close_data')]
     ]
     await message.reply(
-        f'📝 **Index Request**\nTotal: `{last_msg_id}`\n\n'
-        f'⚠️ **"RESET DB" will delete all existing data!**\nUse this to fix "Duplicates" issues.',
+        f'📝 **Index Request**\nTotal Messages: `{last_msg_id}`\n\n'
+        f'⚠️ **Check your `INDEX_EXTENSIONS` in config if files are skipped!**',
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
