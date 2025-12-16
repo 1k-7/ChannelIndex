@@ -4,7 +4,6 @@ import asyncio
 import logging
 import time
 import re
-from typing import Union, Optional, List
 from aiohttp import web, ClientSession 
 from pyrogram import Client, filters, enums, idle, types
 from pyrogram.errors import FloodWait, RPCError
@@ -60,10 +59,10 @@ def get_readable_time(seconds: int) -> str:
 lock = asyncio.Lock()
 CANCEL = False 
 BATCH_SIZE = 200
-WORKER_COUNT = 10  # Reduced slightly to prevent network congestion/FloodWait
-STATUS_UPDATE_INTERVAL = 20 # Seconds (Slower updates = Less FloodWait)
+WORKER_COUNT = 15
+STATUS_UPDATE_INTERVAL = 20
 
-# Global State for /ts command
+# Global State
 CURRENT_PROCESS = {
     'chat_name': 'None',
     'total_msgs': 0,
@@ -75,7 +74,6 @@ CURRENT_PROCESS = {
     }
 }
 
-# --- BOT CLIENT ---
 app = Client(
     "BackupChannelBot",
     api_id=API_ID,
@@ -83,57 +81,106 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-# --- WORKER LOGIC ---
+# --- MEMORY EFFICIENT BACKUP ---
+async def send_backup(client, target_chat_id, status_msg=None):
+    file_path = "channel_backup.json"
+    
+    if status_msg:
+        await status_msg.edit("📦 **Exporting Data...**\nStreaming data to file (Memory Efficient Mode).")
+    else:
+        await client.send_message(target_chat_id, "📦 **Starting Export...**")
+
+    try:
+        # Check if data exists
+        total_docs = await db.total_documents()
+        if total_docs == 0:
+            return await client.send_message(target_chat_id, "⚠️ Database is empty.")
+
+        # STREAMING WRITE (Low RAM Usage)
+        cursor = db.get_cursor()
+        
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write("[\n") # Start JSON Array
+            
+            first = True
+            count = 0
+            
+            async for doc in cursor:
+                if '_id' in doc: del doc['_id'] # Remove ObjectID
+                
+                if not first:
+                    f.write(",\n")
+                
+                # Dump single object to string and write immediately
+                f.write(json.dumps(doc, ensure_ascii=False))
+                
+                first = False
+                count += 1
+                
+                # Log progress every 50k
+                if count % 50000 == 0:
+                    logger.info(f"Exported {count} records...")
+
+            f.write("\n]") # End JSON Array
+
+        file_size = os.path.getsize(file_path) / (1024 * 1024) # MB
+        caption = f"📦 **Backup Complete**\nRecords: `{count}`\nSize: `{file_size:.2f} MB`"
+
+        # If file is > 50MB (Telegram Bot Limit for normal send_document),
+        # Pyrogram usually handles it, but Render upload speed might timeout.
+        # We try standard send.
+        
+        await client.send_document(
+            chat_id=target_chat_id, 
+            document=file_path, 
+            caption=caption
+        )
+        
+    except Exception as e:
+        logger.error(f"Backup error: {e}")
+        await client.send_message(target_chat_id, f"❌ Export Failed: `{str(e)}`")
+    finally:
+        if os.path.exists(file_path): os.remove(file_path)
+
+
+# --- INDEXING WORKER LOGIC ---
 
 async def fetch_and_process_batch(bot, chat_id, batch_ids):
-    """
-    Fetches messages and validates them. 
-    """
     valid_docs = []
     s = {'deleted': 0, 'no_media': 0, 'unsupported': 0, 'processed': 0, 'errors': 0}
     
     messages = []
     retries = 0
     
-    # 1. Reliable Fetch Loop
     while True:
         try:
             messages = await bot.get_messages(chat_id, batch_ids)
             break 
         except FloodWait as e:
-            # If we get floodwait fetching messages, we MUST wait.
-            # We log it so the user knows why it's "stuck"
-            logger.warning(f"⚠️ Fetch FloodWait: Sleeping {e.value}s")
-            await asyncio.sleep(e.value + 5)
+            await asyncio.sleep(e.value + 2)
         except Exception as e:
             retries += 1
             if retries >= 3:
                 s['errors'] += len(batch_ids)
-                logger.error(f"❌ Batch Failed {batch_ids[0]}-{batch_ids[-1]}: {e}")
                 return [], s
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
 
     if not messages:
-        # If get_messages returns empty list, it usually means IDs are invalid/deleted
         s['deleted'] += len(batch_ids)
         return [], s
 
     s['processed'] = len(messages)
 
     for message in messages:
-        # 1. Empty/Service check
         if not message or message.empty or message.service:
             s['deleted'] += 1
             continue
         
-        # 2. Media check
         if not message.media:
             s['no_media'] += 1
             continue
             
-        # 3. Type check (Strictly Video/Audio/Document)
         if message.media not in [enums.MessageMediaType.VIDEO, enums.MessageMediaType.DOCUMENT, enums.MessageMediaType.AUDIO]:
-            # This counts Photos, VoiceNotes, Stickers as unsupported
             s['unsupported'] += 1
             continue
 
@@ -143,10 +190,7 @@ async def fetch_and_process_batch(bot, chat_id, batch_ids):
             s['unsupported'] += 1
             continue
 
-        # 4. Extension check
-        # Use filename or fallback to unique_id if video
         file_name = getattr(media, "file_name", None)
-        
         if not file_name:
              if message.media == enums.MessageMediaType.VIDEO:
                  file_name = f"video_{media.file_unique_id}.mp4"
@@ -156,13 +200,9 @@ async def fetch_and_process_batch(bot, chat_id, batch_ids):
                  s['unsupported'] += 1
                  continue
         
-        # Clean filename
         clean_name = re.sub(r"@\w+|(_|\-|\.|\+)", " ", str(file_name))
         
-        # STRICT EXTENSION FILTER (This might be why your ratio is low)
-        # We log rejected extensions to help you debug.
         if not str(file_name).lower().endswith(tuple(INDEX_EXTENSIONS)):
-            # logger.info(f"Skipped Ext: {file_name}") # Uncomment to debug specific files
             s['unsupported'] += 1
             continue
         
@@ -186,25 +226,18 @@ async def fetch_and_process_batch(bot, chat_id, batch_ids):
     return valid_docs, s
 
 async def worker(queue, bot, chat_id):
-    """
-    Worker now updates the GLOBAL variable directly.
-    """
     global CURRENT_PROCESS
-    
     while True:
         batch_ids = await queue.get()
         if batch_ids is None: 
             queue.task_done()
             break
-        
         if CANCEL:
             queue.task_done()
             continue
 
         try:
             docs, s = await fetch_and_process_batch(bot, chat_id, batch_ids)
-            
-            # Update Global Stats atomically-ish
             CURRENT_PROCESS['stats']['processed'] += s['processed']
             CURRENT_PROCESS['stats']['deleted'] += s['deleted']
             CURRENT_PROCESS['stats']['no_media'] += s['no_media']
@@ -215,7 +248,6 @@ async def worker(queue, bot, chat_id):
                 saved, dups = await db.save_batch(docs)
                 CURRENT_PROCESS['stats']['saved'] += saved
                 CURRENT_PROCESS['stats']['dups'] += dups
-                
         except Exception as e:
             logger.error(f"Worker Exception: {e}")
         finally:
@@ -225,7 +257,6 @@ async def index_files_to_db(last_msg_id: int, chat, msg: Message, bot: Client, s
     global CANCEL, CURRENT_PROCESS
     CANCEL = False
     
-    # Initialize Global State
     CURRENT_PROCESS = {
         'chat_name': chat.title,
         'total_msgs': (last_msg_id - start_from),
@@ -241,207 +272,114 @@ async def index_files_to_db(last_msg_id: int, chat, msg: Message, bot: Client, s
     all_ids = list(range(start_from + 1, last_msg_id + 1))
     
     if not all_ids:
-        await msg.edit("⚠️ No messages to index.")
+        await msg.edit("⚠️ No messages.")
         return
 
-    # Fill Queue
     chunks = [all_ids[i:i + BATCH_SIZE] for i in range(0, len(all_ids), BATCH_SIZE)]
-    for chunk in chunks:
-        queue.put_nowait(chunk)
-    for _ in range(WORKER_COUNT):
-        queue.put_nowait(None)
+    for chunk in chunks: queue.put_nowait(chunk)
+    for _ in range(WORKER_COUNT): queue.put_nowait(None)
     
-    await msg.edit(
-        f"🚀 **Indexing Started!**\n\n"
-        f"Channel: `{chat.title}`\n"
-        f"Total: `{len(all_ids)}`\n"
-        f"Workers: `{WORKER_COUNT}`\n\n"
-        f"ℹ️ **Use /ts to check status if I get stuck.**"
-    )
-    
+    await msg.edit(f"🚀 **Indexing {chat.title}**\nMsgs: `{len(all_ids)}`")
     workers = [asyncio.create_task(worker(queue, bot, chat.id)) for _ in range(WORKER_COUNT)]
     
-    # Main Monitor Loop
     while not queue.empty():
         if CANCEL: break
         await asyncio.sleep(STATUS_UPDATE_INTERVAL)
-        
-        # Calculate stats from Global
         st = CURRENT_PROCESS['stats']
         total = CURRENT_PROCESS['total_msgs']
-        processed_total = st['processed'] + st['deleted'] + st['no_media'] + st['unsupported'] # Approx total handled IDs
-        
-        # Use real start time
-        start_t = CURRENT_PROCESS['start_time']
-        time_taken = get_readable_time(time.time() - start_t)
-        
-        percent = (processed_total / total) * 100 if total > 0 else 0
-        
+        done = st['processed'] + st['deleted'] + st['no_media'] + st['unsupported']
+        percent = (done / total) * 100 if total > 0 else 0
         try:
             btn = [[InlineKeyboardButton('STOP', callback_data=f'index#cancel')]]
             await msg.edit_text(
-                f"🛡️ **Indexing... {percent:.1f}%**\n\n"
-                f"Scanned: `{processed_total}`\n"
+                f"🛡️ **Indexing... {percent:.1f}%**\n"
                 f"Saved: `{st['saved']}` | Dups: `{st['dups']}`\n"
-                f"Deleted/Empty: `{st['deleted']}`\n"
-                f"Skip (Media/Type): `{st['no_media'] + st['unsupported']}`\n"
-                f"Time: `{time_taken}`",
+                f"Scanned: `{done}` / `{total}`",
                 reply_markup=InlineKeyboardMarkup(btn)
             )
-        except FloodWait as e:
-            # If we hit floodwait here, just wait, don't crash. Workers keep going.
-            logger.warning(f"UI FloodWait: {e.value}s")
-            await asyncio.sleep(e.value)
-        except Exception:
-            pass
+        except: pass
 
     await queue.join()
     for w in workers: w.cancel()
-    
     CURRENT_PROCESS['active'] = False
-    time_taken = get_readable_time(time.time() - CURRENT_PROCESS['start_time'])
+    
     st = CURRENT_PROCESS['stats']
-    
-    final_text = (
-        f"✅ **Indexing Complete!**\n\n"
-        f"Saved: `{st['saved']}`\n"
+    await msg.edit(
+        f"✅ **Done!**\nSaved: `{st['saved']}`\n"
         f"Duplicates: `{st['dups']}`\n"
-        f"Skipped: `{st['deleted'] + st['no_media'] + st['unsupported']}`\n"
-        f"Time: `{time_taken}`\n\n"
-        f"**Sending JSON...**"
+        f"**Exporting JSON...**"
     )
-    
-    try:
-        await msg.edit(final_text)
-    except:
-        await msg.reply(final_text)
-        
-    await send_backup(bot, msg.chat.id)
-
-async def send_backup(client, target_chat_id):
-    file_path = "channel_backup.json"
-    try:
-        data = await db.get_all_data()
-        if not data:
-            return await client.send_message(target_chat_id, "⚠️ Database is empty.")
-        
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-
-        await client.send_document(
-            chat_id=target_chat_id, 
-            document=file_path, 
-            caption=f"📦 **Backup**\nFiles: `{len(data)}`"
-        )
-    except Exception as e:
-        logger.error(f"Backup error: {e}")
-    finally:
-        if os.path.exists(file_path): os.remove(file_path)
+    await send_backup(bot, msg.chat.id, msg)
 
 # --- COMMANDS ---
 
+@app.on_message(filters.command('export') & filters.private & filters.user(OWNER_ID))
+async def export_command(client, message):
+    """Manually trigger backup of current DB"""
+    await send_backup(client, message.chat.id)
+
 @app.on_message(filters.command('ts') & filters.private & filters.user(OWNER_ID))
 async def total_status_command(client, message):
-    """
-    Force sends a new status message. Useful if the main message is stuck.
-    """
-    if not CURRENT_PROCESS['active']:
-        return await message.reply("💤 No active indexing process.")
-        
+    if not CURRENT_PROCESS['active']: return await message.reply("💤 Idle.")
     st = CURRENT_PROCESS['stats']
     total = CURRENT_PROCESS['total_msgs']
-    processed_total = st['processed'] + st['deleted'] + st['no_media'] + st['unsupported']
-    
-    percent = (processed_total / total) * 100 if total > 0 else 0
-    time_taken = get_readable_time(time.time() - CURRENT_PROCESS['start_time'])
-    
-    text = (
-        f"📊 **Current Status (Force Check)**\n\n"
-        f"Channel: `{CURRENT_PROCESS['chat_name']}`\n"
-        f"Progress: `{processed_total}` / `{total}` ({percent:.1f}%)\n\n"
-        f"✅ Saved: `{st['saved']}`\n"
-        f"♻️ Duplicates: `{st['dups']}`\n"
-        f"🗑️ Deleted/Empty: `{st['deleted']}`\n"
-        f"🚫 No Media: `{st['no_media']}`\n"
-        f"⚠️ Unsupported Type/Ext: `{st['unsupported']}`\n"
-        f"❌ Errors: `{st['errors']}`\n"
-        f"⏱️ Time: `{time_taken}`"
+    done = st['processed'] + st['deleted'] + st['no_media'] + st['unsupported']
+    await message.reply(
+        f"📊 **Status**\n"
+        f"Progress: `{done}` / `{total}`\n"
+        f"Saved: `{st['saved']}` | Dups: `{st['dups']}`\n"
+        f"Unsupported: `{st['unsupported']}`"
     )
-    await message.reply(text)
 
 @app.on_message(filters.command('start') & filters.private)
 async def start_command(client, message):
-    await message.reply_text("👋 **Robust Indexer**\nUse `/index` to start.\nUse `/ts` for status.")
+    await message.reply_text("👋 **Indexer Bot**\n`/index` - Start\n`/export` - Get Backup\n`/ts` - Status")
 
 @app.on_message(filters.command('index') & filters.private & filters.user(OWNER_ID))
 async def send_for_index(bot: Client, message: Message):
-    if lock.locked():
-        return await message.reply('⚠️ Process running. Use `/ts` to check.')
-    
-    i = await message.reply("Forward **last message** or send link.")
-    try:
-        msg_input = await bot.listen(chat_id=message.chat.id, user_id=message.from_user.id)
-    except:
-        return
+    if lock.locked(): return await message.reply('⚠️ Busy.')
+    i = await message.reply("Forward last msg.")
+    try: msg_input = await bot.listen(chat_id=message.chat.id, user_id=message.from_user.id)
+    except: return
     await i.delete()
-    
-    chat_id, last_msg_id = None, None
     
     if msg_input.text and "t.me" in msg_input.text:
         parts = msg_input.text.split("/")
-        last_msg_id = int(parts[-1])
-        chat_id = int(f"-100{parts[-2]}") if parts[-2].isdigit() else parts[-2]
+        last_msg_id, chat_id = int(parts[-1]), int(f"-100{parts[-2]}") if parts[-2].isdigit() else parts[-2]
     elif msg_input.forward_from_chat:
-        last_msg_id = msg_input.forward_from_message_id
-        chat_id = msg_input.forward_from_chat.id
-    else:
-        return await message.reply('❌ Invalid.')
+        last_msg_id, chat_id = msg_input.forward_from_message_id, msg_input.forward_from_chat.id
+    else: return await message.reply('❌ Invalid.')
 
-    try:
-        await bot.get_chat(chat_id)
-    except:
-        return await message.reply(f'❌ Cannot access chat.')
+    try: await bot.get_chat(chat_id)
+    except: return await message.reply(f'❌ No Access.')
 
-    s = await message.reply("Send skip number (0 for none).")
+    s = await message.reply("Skip? (0 for none)")
     msg_skip = await bot.listen(chat_id=message.chat.id, user_id=message.from_user.id)
     await s.delete()
-    try:
-        skip = int(msg_skip.text)
-    except:
-        skip = 0
+    try: skip = int(msg_skip.text)
+    except: skip = 0
 
     buttons = [
-        [InlineKeyboardButton('YES (CONTINUE)', callback_data=f'index#no#{chat_id}#{last_msg_id}#{skip}')],
-        [InlineKeyboardButton('YES (RESET DB)', callback_data=f'index#reset#{chat_id}#{last_msg_id}#{skip}')],
+        [InlineKeyboardButton('CONTINUE', callback_data=f'index#no#{chat_id}#{last_msg_id}#{skip}')],
+        [InlineKeyboardButton('RESET DB', callback_data=f'index#reset#{chat_id}#{last_msg_id}#{skip}')],
         [InlineKeyboardButton('CLOSE', callback_data='close_data')]
     ]
-    await message.reply(
-        f'📝 **Index Request**\nTotal: `{last_msg_id}`\n\n'
-        f'⚠️ **"RESET DB" deletes all data!**',
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
+    await message.reply(f'📝 **Index** `{last_msg_id}` msgs?', reply_markup=InlineKeyboardMarkup(buttons))
 
 @app.on_callback_query(filters.regex(r'^index'))
 async def index_callback(bot, query):
     global CANCEL
     data = query.data.split("#")
-    
     if data[1] == 'cancel':
         CANCEL = True
         return await query.answer("Stopping...")
-        
-    action, chat_id, last_msg, skip = data[1], int(data[2]), int(data[3]), int(data[4])
-    
-    if action == 'reset':
+    if data[1] == 'reset':
         await db.drop_collection()
-        await query.answer("Database Cleared!", show_alert=True)
-        
-    chat_obj = await bot.get_chat(chat_id)
-    await index_files_to_db(last_msg, chat_obj, query.message, bot, skip)
+        await query.answer("DB Cleared!", show_alert=True)
+    await index_files_to_db(int(data[3]), await bot.get_chat(int(data[2])), query.message, bot, int(data[4]))
 
 @app.on_callback_query(filters.regex(r'^close_data'))
-async def close_callback(bot, query):
-    await query.message.delete()
+async def close_callback(bot, query): await query.message.delete()
 
 if __name__ == "__main__":
     PORT = int(os.environ.get("PORT", 8080))

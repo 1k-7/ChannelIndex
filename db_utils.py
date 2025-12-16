@@ -10,7 +10,7 @@ from config import MONGO_URI, DATABASE_NAME, COLLECTION_NAME
 
 logger = logging.getLogger(__name__)
 
-# --- Custom File ID Encoding (From ia_filterdb.py) ---
+# --- Custom File ID Encoding ---
 def encode_file_id(s: bytes) -> str:
     r = b""
     n = 0
@@ -33,12 +33,8 @@ class Database:
         self.col = self.db[COLLECTION_NAME]
 
     async def save_batch(self, batch_data):
-        """
-        Bulk save using the exact document structure from ia_filterdb.py
-        """
         if not batch_data: return 0, 0
         try:
-            # ordered=False allows valid docs to insert even if some fail (duplicates)
             result = await self.col.insert_many(batch_data, ordered=False)
             inserted = len(result.inserted_ids)
             duplicates = len(batch_data) - inserted
@@ -52,13 +48,21 @@ class Database:
             return 0, 0
 
     async def get_all_data(self):
+        """Deprecated for large datasets. Use get_cursor instead."""
         cursor = self.col.find({})
         data = await cursor.to_list(length=None)
         for item in data:
             if '_id' in item: del item['_id']
         return data
 
+    def get_cursor(self):
+        """Returns an async cursor for streaming data."""
+        return self.col.find({})
+
     async def drop_collection(self):
         await self.col.drop()
+
+    async def total_documents(self):
+        return await self.col.count_documents({})
 
 db = Database()
